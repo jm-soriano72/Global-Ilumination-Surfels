@@ -1,0 +1,35 @@
+# Archivos binarios compilados
+*.exe
+*.dll
+*.so
+*.dylib
+*.out
+
+# Archivos generados por el compilador de shaders de Vulkan
+*.spv
+
+# Archivos temporales y de caché
+*.log
+*.tmp
+*.temp
+.cache/
+*.bak
+
+# Configuración del IDE (añade según uses)
+.vscode/
+.idea/
+*.suo
+*.user
+*.workspace
+
+# Archivos específicos del sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Build directories
+build/
+bin/
+out/
+Debug/
+Release/
