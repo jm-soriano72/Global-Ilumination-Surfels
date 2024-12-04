@@ -18,6 +18,7 @@
 #include <algorithm> // Necessary for std::clamp
 
 #include "VertexBuffer.h"
+#include "UniformBuffer.h"
 
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
@@ -32,7 +33,7 @@ const bool enableValidationLayers = false;
 const bool enableValidationLayers = true;
 #endif
 
-class TriangleApplication {
+class RenderApplication {
 public:
 
 	// Función para leer de un fichero de texto
@@ -67,6 +68,8 @@ private:
 	// Referencias a clases externas
 	// Buffer de vértices
 	VertexBuffer vertexData;
+	// Buffer de variables uniformes
+	UniformBuffer uniformData;
 
 	GLFWwindow* window; // Referencia a la ventana
 	VkInstance instance; // Instancia a Vulkan
@@ -218,7 +221,7 @@ private:
 	}
 
 	static void framebufferResizeCallback(GLFWwindow* window, int width, int height) {
-		auto app = reinterpret_cast<TriangleApplication*>(glfwGetWindowUserPointer(window));
+		auto app = reinterpret_cast<RenderApplication*>(glfwGetWindowUserPointer(window));
 		app->framebufferResized = true;
 	}
 
@@ -232,10 +235,14 @@ private:
 		createSwapChain();
 		createImageViews();
 		createRenderPass();
+		uniformData.createDescriptorSetLayout(device);
 		createGraphicsPipeline();
 		createFramebuffers();
 		createCommandPool();
 		vertexData.createBufferData(device, physicalDevice, commandPool, graphicsQueue);
+		uniformData.createUniformBuffers(device, physicalDevice, MAX_FRAMES_IN_FLIGHT);
+		uniformData.createDescriptorPool(device);
+		uniformData.createDescriptorSets(device);
 		createCommandBuffer();
 		createSyncObjects();
 	}
@@ -711,7 +718,7 @@ private:
 		rasterizer.polygonMode = VK_POLYGON_MODE_FILL; // Se indica cómo se generan los fragmentos a partir de la geometría. Este indica que se van rellenando los polígonos con fragmentos
 		rasterizer.lineWidth = 1.0f;
 		rasterizer.cullMode = VK_CULL_MODE_BACK_BIT; // Configuración del culling
-		rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE; // Sentido horario o antihorario
+		rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; // Sentido horario o antihorario
 		rasterizer.depthBiasEnable = VK_FALSE;
 		rasterizer.depthBiasConstantFactor = 0.0f; // Optional
 		rasterizer.depthBiasClamp = 0.0f; // Optional
@@ -753,8 +760,10 @@ private:
 		// Creación del pipeline layout, para pasar variables uniform a los shaders
 		VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
 		pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-		pipelineLayoutInfo.setLayoutCount = 0; // Optional
-		pipelineLayoutInfo.pSetLayouts = nullptr; // Optional
+		// Se indican los descriptores, es decir las especificaciones necesarias para pasar variables uniformes a los shaders
+		pipelineLayoutInfo.setLayoutCount = 1; 
+		pipelineLayoutInfo.pSetLayouts = &uniformData.descriptorSetLayout;
+
 		pipelineLayoutInfo.pushConstantRangeCount = 0; // Optional
 		pipelineLayoutInfo.pPushConstantRanges = nullptr; // Optional
 
@@ -979,7 +988,9 @@ private:
 		scissor.offset = { 0, 0 };
 		scissor.extent = swapChainExtent;
 		vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-
+		// Se pasa el conjunto de descriptores correcto, en función del número de frame
+		// No son exclusivos para cada pipeline, se pueden reutilizar
+		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &uniformData.descriptorSets[currentFrame], 0, nullptr);
 		// Se añade el comando de dibujado, utilizando los datos de los índices de los vértices
 		vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(vertexData.indices.size()), 1, 0, 0, 0);
 		// 1 significa que no se realiza instance rendering
@@ -1047,7 +1058,10 @@ private:
 		vkResetCommandBuffer(commandBuffer, 0);
 		recordCommandBuffer(commandBuffer, imageIndex);
 
-		// 4. Presentar dicho command buffer a las queues de ejecución
+		// 4. Se actualiza el buffer de variables uniformes
+		uniformData.updateUniformBuffer(currentFrame, swapChainExtent.width, swapChainExtent.height);
+
+		// 5. Presentar dicho command buffer a las queues de ejecución
 		VkSubmitInfo submitInfo{};
 		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
@@ -1067,7 +1081,7 @@ private:
 			throw std::runtime_error("failed to submit draw command buffer!");
 		}
 
-		// 5. Mostrar la imagen del swap chain
+		// 6. Mostrar la imagen del swap chain
 		VkPresentInfoKHR presentInfo{};
 		presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
 
@@ -1129,6 +1143,8 @@ private:
 	void cleanup() {
 		// Se limpian todos los recursos de la swap chain
 		cleanupSwapChain();
+		// Se liberan los recursos del buffer uniforme
+		uniformData.cleanup(device);
 		// Se liberan los recursos del buffer de vértices
 		vertexData.cleanup(device);
 		// Se eliminan las herramientas de sincronización

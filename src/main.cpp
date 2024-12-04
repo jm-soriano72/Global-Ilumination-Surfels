@@ -7,11 +7,11 @@
 #include <glm/mat4x4.hpp>
 
 #include <iostream>
-#include <TriangleApplication.h>
+#include <RenderApplication.h>
 
 int main() {
 
-    TriangleApplication app;
+    RenderApplication app;
 
     try {
         app.run();
