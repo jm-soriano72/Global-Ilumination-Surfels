@@ -1,0 +1,222 @@
+#version 450
+
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+
+#include "bitwise.glsl"
+#include "surfelsData.glsl"
+
+layout(push_constant) uniform PushConstants {
+    float width;
+    float height;
+} windowSize;
+
+vec2 clipConversion = vec2(1/windowSize.width, 2/windowSize.height);
+// Se divide el cómputo en regiones de 16 x 16 threads
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout (binding = 0) buffer SurfelBuffer {
+	Surfel surfelInBuffer[];
+} surfels;
+
+layout (binding = 1) uniform sampler2D normalTexture;
+layout (binding = 2) buffer StatsBuffer {
+	uint stats[8];
+} statsBuffer;
+layout (binding = 3) uniform sampler2D positionTexture;
+layout (binding = 4) buffer GridBuffer {
+	uint cells[SURFEL_TABLE_SIZE];
+} gridCells;
+layout (binding = 5) buffer CellBuffer {
+	uint indexSurfels[SURFEL_TABLE_SIZE * SURFEL_CELL_LIMIT];
+} surfelCells;
+layout (binding = 6) uniform CameraBuffer {
+	mat4 view;
+    	mat4 projection;
+    	vec2 nearFarPlanes;
+        vec2 padding0;
+    	vec4 frame;
+        vec3 position;
+        float padding1;
+} cameraData;
+layout (binding = 7) uniform sampler2D colorTexture;
+layout (binding = 8) uniform sampler2D blueNoiseTexture;
+
+// Variable compartida entre los hilos de un grupo, para determinar qué píxel es el mejor para crear un surfel
+shared uint minTile;
+
+void main() 
+{
+	// El primer hilo del grupo inicializa la variable compartida al valor más alto posible, que se usará para
+	// escoger el píxel con menor cobertura
+	if (gl_LocalInvocationIndex  == 0)
+	{
+		minTile = not(0);
+	}
+	barrier(); // Sincronización de todos los hilos
+
+	// Se obtienen el pixel y las coordenadas de textura utilizando el identificador del hilo
+        vec2 pixel;
+	pixel.x = float(gl_GlobalInvocationID.x) + 0.5;
+	pixel.y = float(gl_GlobalInvocationID.y) + 0.5;
+
+	vec2 uv;
+	uv.x = pixel.x/windowSize.width;
+	uv.y = pixel.y/windowSize.height;
+
+	// Utilizando las coordenadas de textura, se recuperan la posición y normal de las imágenes
+	// almacenadas en el G-Buffer
+	// Se pasa la posición a coordenadas globales
+	vec3 cameraFragPosition = texture(positionTexture, uv).xyz;
+        vec4 worldPos = inverse(cameraData.view) * vec4(cameraFragPosition, 1.0);
+	// Se pasa la normal a coordenadas globales
+	vec3 normal = normalize(inverse(cameraData.view) * vec4(texture(normalTexture, uv).rgb * 2.0 - 1.0, 0.0)).xyz;
+
+	// Se obtiene el color del fragmento para asignarlo al surfel en caso de que se genere
+	vec4 fragColor = texture(colorTexture, uv);
+
+	// Se calcula cómo de cubierto se encuentra un pixel
+	float coverage = 0.0;
+	
+	// Se obtienen las coordenadas del la celda en la que se encuentra el fragmento
+	ivec3 gridPosition = surfel_cell(worldPos.xyz);
+
+	if (!surfel_cellValid(gridPosition))
+	{
+		return;
+	}
+
+	// A través de las coordenadas 3D de la celda, se convierten a un índice lineal, para almacenar
+	// una celda tras otra en una lista unidimensional, con un identificador único
+	uint cellIndex = surfel_cellIndex(gridPosition);
+	// Se obtiene el número de surfels que hay en la celda
+	uint numSurfels_cell = gridCells.cells[cellIndex];
+	
+	// Se calcula cómo de cubierto por los surfels existentes se encuentra el fragmento
+	for (uint i = 0; i < numSurfels_cell; ++i)
+	{
+		// Mediante la lista de surfels por celda, se obtiene el índice del surfel en el buffer global
+		// (No se generan en orden, por ello se necesita el paso intermedio)
+		uint surfel_index = surfelCells.indexSurfels[SURFEL_CELL_LIMIT * cellIndex + i];
+		Surfel surfel = surfels.surfelInBuffer[surfel_index];
+		
+		float dist = distance(surfel.position, worldPos.xyz);
+
+		if (dist < surfel.radius)
+		{
+			vec3 surfelNormal = normalize(surfel.normal);
+			float dotN = dot(normal, surfel.normal);
+			if (dotN > 0)
+			{			
+				float contribution = 1;
+				// Se calcula cuánto influye el surfel en el fragmento en base a la distancia
+				// y a la comparativa de sus normales
+				contribution *= clamp(dotN, 0.0, 1.0);
+				contribution *= clamp(1 - dist / surfel.radius, 0.0, 1.0);
+				contribution = smoothstep(0, 1, contribution);
+				coverage += contribution; // Se incrementa el nivel de cobertura que tiene el fragmento por los surfels existentes
+			}
+		}
+			
+	}
+	
+	// En el caso de que no se haya superado el límite de surfels por celda, se calcula qué hilo tiene el fragmento con
+	// menor influencia de los surfels próximos
+	if (numSurfels_cell < SURFEL_CELL_LIMIT) {
+		uint surfel_count_at_pixel = 0;
+		surfel_count_at_pixel |= (uint(coverage) & 0xFF) << 8;
+		surfel_count_at_pixel |= (gl_LocalInvocationID.x & 0xF) << 4;
+		surfel_count_at_pixel |= (gl_LocalInvocationID.y & 0xF) << 0;
+		minTile = atomicMin(minTile, surfel_count_at_pixel);
+	}
+
+	// Se espera a que todos los hilos hayan calculado cuál es el pixel con menor influencia
+	groupMemoryBarrier();
+	barrier();
+
+	// Se obtienen las coordenadas del pixel, para que cada hilo verifique si es el correcto.
+	// También se comprueba que no supere la influencia máxima
+	uint surfel_coverage = minTile;
+	uvec2 minPixel;
+
+	minPixel.x = (surfel_coverage >> 4) & 0xF;
+	minPixel.y = (surfel_coverage >> 0) & 0xF;
+
+	uint coverage_amount = surfel_coverage >> 8;
+
+	if (gl_LocalInvocationID.x == minPixel.x && gl_LocalInvocationID.y == minPixel.y && coverage < SURFEL_TARGET_COVERAGE)
+	{
+		// Se determina la generación del surfel de forma probabilística, utilizando la profundidad
+		float lineardepth = clamp(-cameraFragPosition.z / cameraData.nearFarPlanes.y, 0.0, 1.0);
+
+		float chance = pow(1.0 - lineardepth, 16.0);
+
+		// Coordenadas pseudoaleatorias basadas en el hilo
+		uvec2 noiseUV = uvec2(gl_GlobalInvocationID.xy) % 128;
+		vec2 uvNoise = vec2(noiseUV) / 128.0;
+
+		vec3 noise = texture(blueNoiseTexture, uvNoise).rgb; 
+		if (noise.r < chance) return;
+
+		// Se recorren todas las celdas contiguas a la del fragmento (3x3x3), para verificar
+		// si el surfel generado cae dentro de alguna de ellas. Si al menos una está llena, se aborta.
+		bool allCellsHaveSpace = true;
+		bool validCells[27];
+		uint neighbourCellIndices[27];
+
+		for (uint i = 0; i < 27; ++i)
+		{
+    			ivec3 neighbourGridPos = ivec3(gridPosition + surfel_neighbour_offsets[i]);
+    			if (!surfel_cellValid(neighbourGridPos)) {
+        			validCells[i] = false;
+        			continue;
+    			}	
+
+    			uint neighbourCellIndex = surfel_cellIndex(neighbourGridPos);
+    			uint currentCount = gridCells.cells[neighbourCellIndex];
+
+    			if (currentCount >= SURFEL_CELL_LIMIT) {
+        			allCellsHaveSpace = false;
+        			break;
+    			}
+
+    			validCells[i] = true;
+    			neighbourCellIndices[i] = neighbourCellIndex;
+		}
+
+		if (allCellsHaveSpace)
+		{
+    			// Se genera el índice del surfel
+    			uint surfel_alloc = atomicAdd(statsBuffer.stats[0], 1);
+    			if (surfel_alloc < SURFEL_CAPACITY)
+    			{
+        			// Se genera el surfel en la posición del fragmento y tomando su normal
+        			Surfel surfel;
+        			surfel.position = worldPos.xyz;
+        			surfel.normal = normal;
+        			surfel.color = fragColor.rgb;
+        			surfel.generatedRays = 1;
+
+        			// Se calcula el radio en función de la profundidad
+        			float surfelDepth = -cameraFragPosition.z;
+        			float f = (windowSize.height * 0.5f) / tan(radians(60.0) * 0.5f);
+        			surfel.radius = (SURFEL_MAX_RADIUS * surfelDepth) / f;
+
+        			// Se añade el propio surfel a la lista global
+        			surfels.surfelInBuffer[surfel_alloc] = surfel;
+
+        			// Ahora que ya sabemos que todas tienen hueco, insertamos con atomicAdd
+        			for (uint i = 0; i < 27; ++i)
+        			{
+            				if (validCells[i]) {
+               					uint cellIdx = neighbourCellIndices[i];
+                				uint idxInCell = atomicAdd(gridCells.cells[cellIdx], 1);
+                				uint finalIdx = cellIdx * SURFEL_CELL_LIMIT + idxInCell;
+                				surfelCells.indexSurfels[finalIdx] = surfel_alloc;
+            				}			
+        			}
+    			}
+		}
+	}
+}

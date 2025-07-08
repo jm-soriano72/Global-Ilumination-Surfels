@@ -1,0 +1,186 @@
+#version 460
+
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_AMD_gpu_shader_int16 : require
+
+#include "surfelsData.glsl"
+
+#define NUM_LIGHTS 4
+
+const float EPSILON = 0.001;
+
+layout (local_size_x = 64) in;
+
+layout (binding = 0) uniform accelerationStructureEXT topLevelAS;
+struct Light {
+    vec3 position;
+    float intensity;
+    vec3 color;
+};
+struct MainDirectionalLight {
+    vec3 position;
+    vec3 target;
+    vec3 direction;
+    float intensity;
+};
+layout(binding = 1) uniform LightsData {
+    Light lights[NUM_LIGHTS];
+    MainDirectionalLight mainLight;
+} sceneLights;
+layout (binding = 2) buffer SurfelBuffer {
+	Surfel surfelInBuffer[];
+} surfels;
+layout (binding = 3) buffer IndexBufferList {
+	uint16_t indexList[];
+} indexInstanceBuffers[];
+
+struct Vertex
+{
+    vec3 normal;
+    int idMaterial;
+    vec2 uv;
+    vec2 pad;
+};
+
+layout (std430, binding = 4) buffer VertexBufferList {
+	Vertex vertexList[];
+} vertexInstanceBuffers[];
+layout (binding = 5) uniform sampler2D[] texSamplers;
+layout (binding = 6) uniform sampler2D rayDirectionsTexture;
+
+vec3 cosineSampleHemisphere(vec2 xi) {
+    float r = sqrt(xi.x);
+    float angle = 2.0 * PI * xi.y;
+    float x = r * cos(angle);
+    float y = r * sin(angle);
+    float z = sqrt(max(0.0, 1.0 - x*x - y*y));
+    return vec3(x, y, z);
+}
+
+void setOrthonormalBasis(vec3 N, out vec3 T, out vec3 B) {
+    if (abs(N.z) < 0.999) {
+        T = normalize(cross(N, vec3(0.0, 0.0, 1.0)));
+    } else {
+        T = normalize(cross(N, vec3(0.0, 1.0, 0.0)));
+    }
+    B = cross(N, T);
+}
+
+void main() 
+{
+	// Se obtiene el identificador global, para acceder una sola vez a cada surfel
+	uint threadIdx = gl_GlobalInvocationID.x;
+	if (threadIdx >= surfels.surfelInBuffer.length()) return;
+
+	Surfel surfel = surfels.surfelInBuffer[threadIdx];
+	if (surfel.generatedRays == 0 || surfel.generatedRays >= MAX_RAYS_PER_SURFEL) return;
+
+	// Se genera una semilla pseudo-aleatoria para obtener la dirección del rayo desde la textura
+	uint seed = hash_uint(threadIdx);
+
+	// Se construye una base TBN con la normal del surfel, para pasar de espacio local a global
+	vec3 T, B;
+        setOrthonormalBasis(surfel.normal, T, B);
+
+	// Radiancia acumulada del surfel
+	vec3 accumulatedRadiance = vec3(0.0);
+
+        int numRays = 0;
+
+	// Se utiliza la textura con las direcciones para generar los rayos formando un hemisferio orientado con la normal del surfel
+	for (int i = 0; i < NUM_RAYS; i++)
+	{
+		if (surfel.generatedRays >= MAX_RAYS_PER_SURFEL) break;
+		numRays++;
+		surfels.surfelInBuffer[threadIdx].generatedRays++;
+
+		int side = textureSize(rayDirectionsTexture, 0).x;
+		ivec2 coord = ivec2(i % side, (seed + i / side) % side);
+		vec2 xi = texelFetch(rayDirectionsTexture, coord, 0).xy;
+
+		// Se utiliza la muestra obtenida para obtener la dirección del rayo
+		vec3 localDirection = cosineSampleHemisphere(xi);
+		// Se pasa la dirección calculada a espacio global
+		vec3 globalRayDirection = normalize(T * localDirection.x + B * localDirection.y + surfel.normal * localDirection.z);
+		// Se lanza un rayo en la dirección calculada
+		rayQueryEXT rayQuery;
+    		rayQueryInitializeEXT(rayQuery, topLevelAS, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, surfel.position + surfel.normal * EPSILON, 0.01, globalRayDirection, RAYS_LENGTH);
+    		rayQueryProceedEXT(rayQuery);
+
+		// Si se produce intersección con la geometría de la escena, se comprueba la visibilidad del fragmento, para ver si está iluminado o no
+    		if (rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+
+			// Se obtiene el punto de intersección
+			vec3 rayOrigin = rayQueryGetWorldRayOriginEXT(rayQuery);
+			vec3 rayDirection = rayQueryGetWorldRayDirectionEXT(rayQuery);
+			float t = rayQueryGetIntersectionTEXT(rayQuery, true); // Distancia a la intersección
+			vec3 hitPos = rayOrigin + t * rayDirection;
+
+			// Se lanza un rayo desde la posición de la colisión
+			vec3 L = normalize(sceneLights.mainLight.position - hitPos); // Dirección del rayo del fragmento a la luz
+
+			rayQueryEXT visibilityRayQuery;
+    			rayQueryInitializeEXT(visibilityRayQuery, topLevelAS, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, hitPos + surfel.normal * EPSILON, 0.01, L, 5000.0);
+			rayQueryProceedEXT(visibilityRayQuery);
+			// Si el rayo choca con la geometría, quiere decir que el fragmento no está iluminado
+			if (rayQueryGetIntersectionTypeEXT(visibilityRayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+				continue;
+    			}
+
+			// Si el rayo no ha chocado con la geometría, quiere decir que el fragmento está iluminado
+			// Se obtiene el índice de la BLAS con la que ha colisionado el rayo
+			uint instanceId = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true);
+			// Se consigue el índice de la primitiva dentro de la BLAS
+			uint primitiveId = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true) * 3;
+
+			uint16_t idVertex0 = indexInstanceBuffers[nonuniformEXT(instanceId)].indexList[primitiveId];
+			uint16_t idVertex1 = indexInstanceBuffers[nonuniformEXT(instanceId)].indexList[primitiveId + 1];
+			uint16_t idVertex2 = indexInstanceBuffers[nonuniformEXT(instanceId)].indexList[primitiveId + 2];
+
+			Vertex vertex_0 = vertexInstanceBuffers[nonuniformEXT(instanceId)].vertexList[idVertex0];
+			Vertex vertex_1 = vertexInstanceBuffers[nonuniformEXT(instanceId)].vertexList[idVertex1];
+			Vertex vertex_2 = vertexInstanceBuffers[nonuniformEXT(instanceId)].vertexList[idVertex2];
+	
+			// Se calculan las coordenadas de textura del fragmento en el punto de colisión utilizando las coordenadas baricéntricas
+			vec2 baricentricCoords = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+			float b = baricentricCoords.x;
+			float c = baricentricCoords.y;
+			float a = 1 - b - c;
+			vec2 uv = a * vertex_0.uv + b * vertex_1.uv + c * vertex_2.uv;
+
+			// Se obtiene el color y se calcula su componente difusa
+			uint materialId = vertex_0.idMaterial * 3;
+			vec3 albedo = texture(texSamplers[nonuniformEXT(materialId)], uv).rgb;
+
+			// Se interpola la normal de los vértices
+			vec3 interpolatedNormal = normalize(a * normalize(vertex_0.normal) + b * normalize(vertex_1.normal) + c * normalize(vertex_2.normal));
+
+			vec3 diffuse = sceneLights.mainLight.intensity * albedo * max(dot(L, interpolatedNormal), 0.0);
+			
+			accumulatedRadiance += diffuse;
+    		}
+		
+	}
+	
+	accumulatedRadiance /= numRays;
+	surfels.surfelInBuffer[threadIdx].direct_radiance += accumulatedRadiance;
+}
+
+
+
+
+
+
+
+
+
+
+
+

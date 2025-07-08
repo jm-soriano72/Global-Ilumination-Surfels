@@ -1,0 +1,28 @@
+#pragma once
+
+#include "Tools/ShaderStagesCreator.h"
+#include "ComputePipeline.h"
+
+#define VK_USE_PLATFORM_WIN32_KHR
+#define GLFW_INCLUDE_VULKAN
+#define GLFW_EXPOSE_NATIVE_WIN32
+
+#include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
+
+#include <iostream>
+#include <fstream>
+#include <stdexcept>
+#include <vector>
+#include <set>
+#include <string>
+#include <iostream>
+#include <cstdint>
+#include <limits>
+#include <algorithm>
+
+class SurfelsGenerationPipeline : public ComputePipeline
+{
+public:
+    void createGraphicsPipeline(VkDevice device, VkDescriptorSetLayout descriptorSetLayout) override;
+};

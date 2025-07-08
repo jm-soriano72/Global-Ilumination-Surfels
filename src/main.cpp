@@ -1,16 +1,20 @@
-#define GLFW_INCLUDE_VULKAN
-#include <GLFW/glfw3.h>
+#pragma once
 
-#define GLM_FORCE_RADIANS
-#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include "RenderApplication.h"
+
+#include <GLFW/glfw3.h>
 #include <glm/vec4.hpp>
 #include <glm/mat4x4.hpp>
 
 #include <iostream>
-#include <RenderApplication.h>
+
+#define GLFW_INCLUDE_VULKAN
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
 
 int main() {
 
+    float num = 1.0f;
     RenderApplication app;
 
     try {
